@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NotebookLM 一鍵生成互動式報告
 // @namespace    https://github.com/yueh-notebooklm
-// @version      12.7
+// @version      12.8
 // @updateURL    https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.meta.js
 // @downloadURL  https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.user.js
 // @description  開分頁就自動完成「取連結 → 建立筆記本 → 匯入來源 → 逐一生成互動式報告」；內建閱讀模式與斷點續跑
@@ -18,9 +18,15 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  const VERSION = '12.7';
+  const VERSION = '12.8';
 
   /* ============================================================
+   * ★ v12.8 2026-10-09 設定入口與選單診斷
+   *   現象：使用者已確認 menu grant 存在，擴充功能選單仍沒有設定入口。
+   *   缺口：API 不可用時靜默返回，不能判斷註冊狀態；確切環境原因尚未確定。
+   *   修法：浮動面板直接提供「⚙ 設定網址」，共用保存流程；註冊失敗不阻斷主流程。
+   *   診斷只顯示狀態，不輸出端點或 token。
+   *
    * ★ v12.7 2026-10-09 多電腦自動更新
    *   updateURL／downloadURL 指向獨立腳本倉庫；沿用 name／namespace。
    *   Web App 個人網址改存 GM 儲存，程式更新不再清空設定。
@@ -390,32 +396,46 @@
         /^\/macros\/s\/[^/]+\/exec$/.test(u.pathname) && !!u.searchParams.get('token');
     } catch (_) { return false; }
   }
+  const personalSettingsStatus = { menu: '未嘗試' };
+  function editWebAppSettings() {
+    if (running || importing || layoutBusy) {
+      REAL_WINDOW.alert('目前有工作執行中，請完成或停止後再設定網址。');
+      return;
+    }
+  const input = REAL_WINDOW.prompt('請貼上 showWebAppEndpoint() 取得的完整網址。只保存在本機竄改猴，不需傳給 AI。', '');
+  if (input === null) return;
+  const value = input.trim();
+  if (!validWebAppUrl(value)) {
+    REAL_WINDOW.alert('網址格式不符：需要 script.google.com/macros/s/.../exec，且含 token 參數。');
+    return;
+  }
+  // 設定失敗不可宣稱成功，避免在舊 API 失效時默默丟失個人設定。
+  try {
+    if (typeof GM_setValue !== 'function' || typeof GM_getValue !== 'function') throw new Error('GM storage unavailable');
+    GM_setValue(WEBAPP_SETTING_KEY, value);
+    if (GM_getValue(WEBAPP_SETTING_KEY, '') !== value) throw new Error('GM storage verification failed');
+  } catch (_) {
+    REAL_WINDOW.alert('設定未保存，請檢查竄改猴儲存權限後再試。');
+    return;
+  }
+  CFG.WEBAPP_URL = value;
+  REAL_WINDOW.alert('已保存。請在目前工作完成後重新整理 NotebookLM 分頁。');
+  }
   function initializePersonalSettings() {
     const saved = gmGet(WEBAPP_SETTING_KEY, '');
     if (saved && validWebAppUrl(saved)) CFG.WEBAPP_URL = saved;
     else if (CFG.WEBAPP_URL && validWebAppUrl(CFG.WEBAPP_URL)) gmSet(WEBAPP_SETTING_KEY, CFG.WEBAPP_URL);
     else CFG.WEBAPP_URL = '';
-    if (typeof GM_registerMenuCommand !== 'function') return;
-    GM_registerMenuCommand('設定 Web App 網址（更新後保留）', () => {
-      const input = REAL_WINDOW.prompt('請貼上 showWebAppEndpoint() 取得的完整網址。只保存在本機竄改猴，不需傳給 AI。', '');
-      if (input === null) return;
-      const value = input.trim();
-      if (!validWebAppUrl(value)) {
-        REAL_WINDOW.alert('網址格式不符：需要 script.google.com/macros/s/.../exec，且含 token 參數。');
-        return;
-      }
-      // 設定失敗不可宣稱成功，避免在舊 API 失效時默默丟失個人設定。
-      try {
-        if (typeof GM_setValue !== 'function' || typeof GM_getValue !== 'function') throw new Error('GM storage unavailable');
-        GM_setValue(WEBAPP_SETTING_KEY, value);
-        if (GM_getValue(WEBAPP_SETTING_KEY, '') !== value) throw new Error('GM storage verification failed');
-      } catch (_) {
-        REAL_WINDOW.alert('設定未保存，請檢查竄改猴儲存權限後再試。');
-        return;
-      }
-      CFG.WEBAPP_URL = value;
-      REAL_WINDOW.alert('已保存。請在目前工作完成後重新整理 NotebookLM 分頁。');
-    });
+    if (typeof GM_registerMenuCommand !== 'function') {
+      personalSettingsStatus.menu = 'API 不可用';
+      return;
+    }
+    try {
+      GM_registerMenuCommand('設定 Web App 網址（更新後保留）', editWebAppSettings);
+      personalSettingsStatus.menu = '註冊呼叫成功（顯示仍以擴充功能實況為準）';
+    } catch (_) {
+      personalSettingsStatus.menu = '註冊呼叫失敗';
+    }
   }
   initializePersonalSettings();
 
@@ -654,7 +674,9 @@
     };
     const btnImport = mkAction('📥 匯入＋生成', '#1e8e3e');
     btnImport.title = '從剪貼簿讀連結 → 建立筆記本 → 匯入來源 → 逐一生成';
-    rowMain.append(btnImport);
+    const btnSettings = mkAction('⚙ 設定網址', '#5f6368');
+    btnSettings.title = '設定 Web App 網址（更新後保留）';
+    rowMain.append(btnImport, btnSettings);
 
     const row = document.createElement('div');
     row.style.cssText = 'display:flex;gap:6px;margin-bottom:8px;';
@@ -712,7 +734,7 @@
     document.addEventListener('mouseup', () => { drag = false; });
 
     return {
-      panel, dot, bar, btnDiag, btnLayout, btnImport, btnRun, btnRetry, btnStop, setFold,
+      panel, dot, bar, btnDiag, btnLayout, btnImport, btnSettings, btnRun, btnRetry, btnStop, setFold,
       /** mode: 'reading' | 'normal'；busy=true 時禁用（生成中或切換中） */
       setLayoutBtn(mode, busy) {
         const reading = (mode === 'reading');
@@ -2110,6 +2132,7 @@
   /* ── 選擇器校正用診斷 ── */
   function diagnoseImportUI() {
     UI.log('🔧 匯入 UI 診斷開始');
+    UI.log(`   設定選單：${personalSettingsStatus.menu}｜面板設定按鈕=${UI.btnSettings ? '有' : '無'}`);
     UI.log(`   網址=${location.pathname}｜筆記本頁=${isNotebookPage()}｜來源計數=${readSourceCount()}`);
 
     const dlg = getDialog();
@@ -2328,6 +2351,8 @@
    * ========================================================== */
   UI.btnImport.onclick = () => runImportAndGenerate(null)
     .catch(err => UI.log(`⚠️ 匯入流程例外：${err.message}`));
+  UI.btnSettings.onclick = editWebAppSettings;
+  UI.log(`⚙ 設定網址請點面板按鈕｜擴充功能選單：${personalSettingsStatus.menu}`);
   UI.btnRun.onclick   = () => run(null);
   UI.btnStop.onclick  = () => { stopFlag = true; UI.log('⏹ 已送出中止訊號…'); };
   UI.btnRetry.onclick = () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NotebookLM 一鍵生成互動式報告
 // @namespace    https://github.com/yueh-notebooklm
-// @version      12.7
+// @version      12.8
 // @updateURL    https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.meta.js
 // @downloadURL  https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.user.js
 // @description  開分頁就自動完成「取連結 → 建立筆記本 → 匯入來源 → 逐一生成互動式報告」；內建閱讀模式與斷點續跑
