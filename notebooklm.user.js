@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NotebookLM 一鍵生成互動式報告
 // @namespace    https://github.com/yueh-notebooklm
-// @version      12.8
+// @version      12.9
 // @updateURL    https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.meta.js
 // @downloadURL  https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.user.js
 // @description  開分頁就自動完成「取連結 → 建立筆記本 → 匯入來源 → 逐一生成互動式報告」；內建閱讀模式與斷點續跑
@@ -18,9 +18,15 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  const VERSION = '12.8';
+  const VERSION = '12.9';
 
   /* ============================================================
+   * ★ v12.9 2026-10-09 來源指南復原與報告入口
+   *   實況：失敗後可見「關閉來源指南」，來源計數 11、清單 checkbox 0。
+   *   已確認：來源指南狀態缺乏返回處理；誤點報告與 checkbox 冒泡為待驗證風險。
+   *   修法：來源切換先關指南；checkbox click 不冒泡至來源列；報告入口精確比對與即時查詢。
+   *   保留短逾時與整批失敗隔離，新增狀態紀錄；診斷過濾帳戶文字。
+   *
    * ★ v12.8 2026-10-09 設定入口與選單診斷
    *   現象：使用者已確認 menu grant 存在，擴充功能選單仍沒有設定入口。
    *   缺口：API 不可用時靜默返回，不能判斷註冊狀態；確切環境原因尚未確定。
@@ -454,7 +460,10 @@
     dialog:     'mat-dialog-container, .cdk-overlay-pane [role="dialog"], .mat-mdc-dialog-container',
     overlayBackdrop: '.cdk-overlay-backdrop',
     tabText:    { source: /^\s*(來源|Sources?)\s*$/, studio: /^\s*(工作室|Studio)\s*$/ },
-    reportText: /報告|Report/,
+    reportText: /^\s*(報告|Reports?|建立報告|Create reports?)\s*$/i,
+    sourceGuideCloseButton: 'button,[role="button"]',
+    sourceGuideCloseText: /^\s*(關閉來源指南|Close source guide)\s*$/i,
+    privateDiagnosticLabel: /(Google\s*帳戶|Google\s*Account|@)/i,
     /* ── ★ v12.4 「建立報告」彈窗（取代舊的「網誌文章」卡片）── */
     /** 彈窗標題，僅供診斷與紀錄辨識用，不作為流程判斷條件 */
     reportDialogTitle: /(建立報告|Create report)/i,
@@ -810,7 +819,11 @@
       if (isChecked(cb) === want) return { ok: true, strategy: name, tried };
       tried++;
       checkVideoTask();
+      // 保留 checkbox 內部事件；阻止 click 繼續冒泡到來源列而開啟指南。
+      const stopRowClick = event => event.stopPropagation();
+      cb.addEventListener('click', stopRowClick);
       try { fn(cb); } catch (e) { /* 換下一招 */ }
+      finally { cb.removeEventListener('click', stopRowClick); }
       const ok = await waitFor(() => {
         const c = get();
         return c && isChecked(c) === want;
@@ -915,6 +928,7 @@
       `srcCollapsed=${sourcePanelCollapsed()}`,
       `mode=${readMode()}`,
       `sourceCount=${readSourceCount()}`,
+      `sourceGuide=${findSourceGuideCloseBtn() ? '有' : '無'}`,
     ].join('｜');
   }
   function deepDump() {
@@ -940,9 +954,26 @@
     return queryAllDeep(SEL.dialog).find(isVisible) || null;
   }
   function findReportBtn() {
-    return queryAllDeep('button,[role="button"]').find(el =>
-      isVisible(el) && SEL.reportText.test(label(el)) && !getDialog()
+    if (getDialog()) return null;
+    const candidates = queryAllDeep('button,[role="button"]').filter(el =>
+      isVisible(el) && !isDisabled(el) && SEL.reportText.test(cleanLabel(el))
+    );
+    // 有歧義時拒絕猜測，避免打開既有報告或其他功能。
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+  function findSourceGuideCloseBtn() {
+    return queryAllDeep(SEL.sourceGuideCloseButton).find(el =>
+      isVisible(el) && SEL.sourceGuideCloseText.test(cleanLabel(el))
     ) || null;
+  }
+  async function closeSourceGuide() {
+    const close = findSourceGuideCloseBtn();
+    if (!close) return;
+    UI.log('↩ 關閉來源指南，返回來源清單');
+    fireClick(close);
+    const ready = await waitFor(() => !findSourceGuideCloseBtn() && liveSources().length > 0,
+      CFG.TAB_VERIFY_MS, CFG.TAB_POLL_MS);
+    if (!ready) throw new Error('關閉來源指南後清單未恢復');
   }
   /**
    * ★ v12.4 「建立報告」彈窗右下的送出鈕。
@@ -1050,6 +1081,7 @@
     return kind === 'source' ? liveSources().length > 0 : !!findReportBtn();
   }
   async function gotoTab(kind) {
+    if (kind === 'source') await closeSourceGuide();
     if (tabReady(kind)) return 0;
     const btn = getTabBtn(kind);
     if (btn) fireClick(btn);
@@ -2142,7 +2174,7 @@
     const btns = queryAllDeep('button,[role="button"],[role="menuitem"],[role="option"]', scope)
       .filter(isVisible)
       .map(el => (label(el) || '').replace(/\s+/g, ' ').trim())
-      .filter(t => t && t.length < 40);
+      .filter(t => t && t.length < 40 && !SEL.privateDiagnosticLabel.test(t));
 
     const uniq = [...new Set(btns)];
     UI.log(`   可見按鈕文字（${uniq.length} 種）：`);
@@ -2190,6 +2222,12 @@
     stage('勾選+驗證');
     const detail = await selectOnly(idx, { count: list.length, title: list[idx].title });
     T.mark('勾選+驗證');
+    stage('確認來源清單');
+    await closeSourceGuide();
+    const selected = liveSources();
+    if (selected.length !== list.length || selected.filter(isChecked).length !== 1 || !isChecked(selected[idx])) {
+      throw new Error('返回來源清單後勾選狀態不符');
+    }
     stage('切工作室');
     await gotoTab('studio');                   T.mark('切工作室');
     stage('找報告按鈕');
@@ -2210,10 +2248,14 @@
       // v11.3 實測：4 部裡有 2 部第一次純 .click() 沒反應，等滿 1500ms 逾時後
       // 才靠帶 mouse 事件的重試在 522ms 內開啟——那 1.5 秒是白等的。
       stage(`開報告彈窗#${attempt}`);
-      fireClick(btn, true);
+      const liveBtn = findReportBtn();
+      if (!liveBtn) throw new Error('找不到唯一可用的報告建立入口');
+      UI.log(`   ▸ 點擊報告入口：${cleanLabel(liveBtn)}｜connected=${liveBtn.isConnected}`);
+      fireClick(liveBtn, true);
       dlg = await waitFor(getDialog, CFG.DIALOG_OPEN_MS);
       T.mark(`彈窗開#${attempt}`);
       if (dlg) break;
+      if (findSourceGuideCloseBtn()) throw new Error('點擊報告後進入來源指南，停止本部以保留現場');
       await sleep(CFG.DIALOG_RETRY_GAP_MS);
     }
     if (!dlg) throw new Error('彈窗未開啟');
