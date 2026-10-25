@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NotebookLM 一鍵生成互動式報告
 // @namespace    https://github.com/yueh-notebooklm
-// @version      12.9
+// @version      12.10
 // @updateURL    https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.meta.js
 // @downloadURL  https://raw.githubusercontent.com/ss890527/notebooklm-userscript/main/notebooklm.user.js
 // @description  開分頁就自動完成「取連結 → 建立筆記本 → 匯入來源 → 逐一生成互動式報告」；內建閱讀模式與斷點續跑
@@ -18,9 +18,16 @@
 // ==/UserScript==
 (function () {
   'use strict';
-  const VERSION = '12.9';
+  const VERSION = '12.10';
 
   /* ============================================================
+   * ★ v12.10 2026-10-25 背景等待與整批報告核對
+   *   實況：六部皆已正確勾選，卻在 107～120 秒硬逾時；重跑 31 秒全數送出。
+   *   已確認：舊碼在讀取結果前檢查牆鐘 deadline；背景節流為待驗證推論。
+   *   修法：排程延後不耗操作預算，醒來先驗結果；保留有限輪詢、串行與停止檢查。
+   *   全部送出後才整批核對；最後送出滿三分鐘再查一次，生成中／不明均不重送。
+   *   送出前持久記帳，核對不把舊報告或無法辨識的 UI 當成功；設定與更新網址沿用。
+   *
    * ★ v12.9 2026-10-09 來源指南復原與報告入口
    *   實況：失敗後可見「關閉來源指南」，來源計數 11、清單 checkbox 0。
    *   已確認：來源指南狀態缺乏返回處理；誤點報告與 checkbox 冒泡為待驗證風險。
@@ -298,9 +305,7 @@
      *  預設不點的理由：格式卡是單選，對已選中的那張再點一次行為未知；
      *  哪天 NotebookLM 把預設改掉，再改這個值即可。 */
     REPORT_FORMAT:  'default',
-    /** ★ v11.4 語意改變：不再是固定睡眠，而是「等工作室出現新卡片」的上限。
-     *  偵測到變化就往下走，通常 300～600ms，逾時才退回等滿 */
-    SUBMIT_BUFFER_MS:    2500,
+    // 送出後只留短暫 UI 收尾時間；報告建立／完成改由整批核對。
     SUBMIT_SETTLE_MS:     250,
     /** ★ v11.6 從 3 提高到 4（共 5 次機會）。逾時降到 800ms 後，
      *  多給機會的成本很低，而彈窗沒開是唯一會讓整部片失敗的環節 */
@@ -317,10 +322,11 @@
     IDLE_POLL_MS:           120,
     /** 等不到閒置也照樣往下走，不讓它變成新的卡點 */
     IDLE_MAX_WAIT_MS:      4000,
-    /** ★ v12.4 60000 → 90000。selectOnly 是 O(來源數) 的逐格點擊＋驗證，
-     *  60 秒是來源只有 4～5 個時訂的預算；11 個來源時光勾選就可能吃掉數十秒。
-     *  來源數若再往上長（20+），這個值要跟著調，或改成依來源數計算。 */
+    /** 單部可用操作預算 90 秒；v12.10 起排除超過容忍值的計時器排程延後。
+     *  非可精準打斷主執行緒的牆鐘上限；有限輪詢／重試仍保留。 */
     VIDEO_HARD_TIMEOUT_MS: 90000,
+    TIMER_LAG_TOLERANCE_MS: 500,
+    REPORT_RECHECK_MS: 180000,
     CLICK_DELAY_MS: 300,
     ONLY_INDEX: null,
     // 閱讀版面
@@ -464,6 +470,16 @@
     sourceGuideCloseButton: 'button,[role="button"]',
     sourceGuideCloseText: /^\s*(關閉來源指南|Close source guide)\s*$/i,
     privateDiagnosticLabel: /(Google\s*帳戶|Google\s*Account|@)/i,
+    // 整批核對只讀工作室報告列；選擇器失配時回報待確認，不依文字長度猜成功。
+    reportItem: 'artifact-library-item, artifact-button, artifact-card, .artifact-item, .artifact-item-container, .artifact-container, [data-artifact-id], [data-report-id]',
+    reportTitle: '.artifact-title, .artifact-name, [data-title], [role="heading"], h3, h4',
+    reportKind: /(?:\barticle\b|\bdescription\b|\binteractive_space\b|互動式報告|報告|\breports?\b)/i,
+    reportPending: /(生成中|產生中|正在生成|正在建立|建立中|處理中|排隊中|generating|creating|processing|queued)/i,
+    reportError: /(生成失敗|產生失敗|建立失敗|無法生成|無法建立|發生錯誤|出了問題|failed|something went wrong|unable to generate)/i,
+    reportViewerClose: /^\s*(關閉互動式報告|Close interactive report)\s*$/i,
+    reportEmptyText: /(你建立的工作室輸出內容.*顯示在這裡|工作室輸出內容.*儲存於此|Studio output will (?:appear|be saved) here)/i,
+    reportInteractive: 'button, [role="button"], a[href]',
+    reportIdentityAttrs: ['data-artifact-id', 'data-report-id'],
     /* ── ★ v12.4 「建立報告」彈窗（取代舊的「網誌文章」卡片）── */
     /** 彈窗標題，僅供診斷與紀錄辨識用，不作為流程判斷條件 */
     reportDialogTitle: /(建立報告|Create report)/i,
@@ -519,23 +535,36 @@
   const LAYOUT_KEY = 'nblm_layout_v1';
   const MODE_KEY   = 'nblm_layout_mode_v1';
   const JOB_KEY    = 'nblm_job_v1';        // ★ v11.0 斷點續跑
+  const REPORT_KEY = 'nblm_report_batch_v1';
 
   /* ============================================================
    * 3. 工具函式
    * ========================================================== */
   let activeVideoTask = null;
-  function checkVideoTask() {
+  let schedulerDelayMs = 0, lastTimerLagMs = 0;
+  const workNow = () => Date.now() - schedulerDelayMs;
+  function checkVideoTask(checkBudget = true) {
     const task = activeVideoTask;
     if (!task) return;
     if (stopFlag) throw new Error(`使用者中止（步驟：${task.stage}）`);
-    if (Date.now() >= task.deadline) throw new Error(`單部硬逾時（步驟：${task.stage}，已 ${Math.round((Date.now() - task.startedAt) / 1000)}s）`);
+    if (checkBudget && workNow() >= task.deadline) throw new Error(`單部操作預算用盡（步驟：${task.stage}，實際經過 ${Math.round((Date.now() - task.startedAt) / 1000)}s，排程延後 ${Math.round((schedulerDelayMs - task.delayAtStart) / 1000)}s）`);
   }
   async function sleep(ms) {
-    checkVideoTask();
+    checkVideoTask(false);
     const end = Date.now() + ms;
     do {
-      await new Promise(r => setTimeout(r, activeVideoTask ? Math.min(100, Math.max(0, end - Date.now())) : Math.max(0, end - Date.now())));
-      checkVideoTask();
+      const requested = activeVideoTask ? Math.min(100, Math.max(0, end - Date.now())) : Math.max(0, end - Date.now());
+      const scheduledAt = Date.now();
+      await new Promise(r => setTimeout(r, requested));
+      lastTimerLagMs = Math.max(0, Date.now() - scheduledAt - requested);
+      if (lastTimerLagMs > CFG.TIMER_LAG_TOLERANCE_MS) {
+        schedulerDelayMs += lastTimerLagMs;
+        if (activeVideoTask && activeVideoTask.lagStage !== activeVideoTask.stage) {
+          activeVideoTask.lagStage = activeVideoTask.stage;
+          UI.log(`   ⓘ 計時器延後 ${Math.round(lastTimerLagMs / 1000)}s｜visibility=${document.visibilityState}｜先核對結果，不直接判失敗`);
+        }
+      }
+      checkVideoTask(false);
     } while (Date.now() < end);
   }
   const now = () => Date.now();
@@ -586,16 +615,19 @@
       .trim();
   }
   async function waitFor(fn, timeoutMs, pollMs = 120) {
-    const deadline = now() + timeoutMs;
-    for (;;) {
-      checkVideoTask();
+    const deadline = workNow() + timeoutMs;
+    const maxChecks = Math.max(1, Math.ceil(timeoutMs / Math.max(1, pollMs)) + 1);
+    for (let checks = 0; checks < maxChecks; checks++) {
+      checkVideoTask(false);
       let v = null;
       try { v = fn(); } catch (e) { v = null; }
-      checkVideoTask();
+      checkVideoTask(false);
       if (v) return v;
-      if (now() > deadline) return null;
+      checkVideoTask();
+      if (workNow() >= deadline || checks + 1 >= maxChecks) return null;
       await sleep(pollMs);
     }
+    return null;
   }
   function makeTimer() {
     let last = now();
@@ -773,7 +805,7 @@
           this.status(`⚠️ 完成，但有 ${fail} 部失敗（雙擊下方紀錄可複製）`);
           return;
         }
-        this.status(`🎉 全部成功 ${ok} 部`);
+        this.status(`📤 已執行送出 ${ok} 部｜生成結果見整批核對`);
         if (CFG.ON_DONE === 'off') return;
         setTimeout(() => {
           if (CFG.ON_DONE === 'close') { panel.style.display = 'none'; dot.style.display = 'block'; }
@@ -917,6 +949,8 @@
   function snapshot() {
     return [
       `viewport=${window.innerWidth}`,
+      `visibility=${document.visibilityState}`,
+      `timerLag=${Math.round(lastTimerLagMs)}ms`,
       `checkbox=${rawCheckboxes().length}`,
       `source=${liveSources().length}`,
       `master=${liveMasters().length}`,
@@ -1019,18 +1053,107 @@
     return true;
   }
 
-  /**
-   * ★ v11.4 工作室面板的內容指紋，用來確認報告真的送出去了。
-   * 送出後工作室會多一張生成中的卡片，面板文字長度隨之改變。
-   * 取最右邊那個 panel-header 的父層當作工作室面板；取不到就回 -1，
-   * 呼叫端會退回原本的固定等待，不會因此失敗。
-   */
-  function studioSignature() {
+  function captureReports() {
     const hs = liveHeaders();
     const hd = hs.length ? hs[hs.length - 1] : null;
     const panel = hd && hd.parentElement;
-    if (!panel) return -1;
-    return (panel.innerText || '').length;
+    if (!panel) return { observable: false, cards: [], reason: '工作室清單不可見' };
+    if (queryAllDeep(SEL.reportInteractive, panel).some(b => SEL.reportViewerClose.test(label(b)))) {
+      return { observable: false, cards: [], reason: '正在閱讀報告，保留目前畫面' };
+    }
+    const candidates = queryAllDeep(SEL.reportItem, panel).filter(isVisible);
+    const rows = candidates.filter(el => !candidates.some(other => other !== el && el.contains(other)));
+    const cards = [];
+    for (const el of rows) {
+      const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!SEL.reportKind.test(text + ' ' + label(el))) continue;
+      let key = '';
+      for (let parent = el, depth = 0; parent && parent !== panel && depth < 5; parent = parent.parentElement, depth++) {
+        for (const attr of SEL.reportIdentityAttrs) {
+          const value = parent.getAttribute(attr);
+          if (value) { key = `${attr}:${value}`; break; }
+        }
+        if (key) break;
+      }
+      const titleEl = el.querySelector(SEL.reportTitle);
+      const title = ((titleEl && (titleEl.innerText || titleEl.textContent)) || label(el) || text).replace(/\s+/g, ' ').trim();
+      const pending = SEL.reportPending.test(text) || queryAllDeep(SEL.spinner, el).some(isVisible);
+      const interactive = el.matches(SEL.reportInteractive) ? el : el.querySelector(SEL.reportInteractive);
+      const status = SEL.reportError.test(text) ? 'google_error' : pending ? 'generating'
+        : interactive && !isDisabled(interactive) && title ? 'completed' : 'unknown';
+      if (!key || !cards.some(c => c.key === key)) cards.push({ key, title, status });
+    }
+    // 選擇器失配不能當作空清單；只有明確的空狀態提示才接受零張基準。
+    const empty = !rows.length && SEL.reportEmptyText.test(panel.innerText || '');
+    return { observable: empty || cards.length > 0, cards,
+      reason: cards.length || empty ? '' : '無法辨識報告清單或空狀態' };
+  }
+  function loadReportBatch() {
+    try {
+      const batch = JSON.parse(localStorage.getItem(`${REPORT_KEY}:${location.pathname}`));
+      return batch && batch.notebook === location.pathname && Array.isArray(batch.attempts) ? batch : null;
+    } catch (_) { return null; }
+  }
+  function saveReportBatch(batch) {
+    // 送出前若無法記帳就停止，避免重整後失憶而重複送出。
+    localStorage.setItem(`${REPORT_KEY}:${location.pathname}`, JSON.stringify(batch));
+  }
+  function summarizeReports(batch, snapshot) {
+    const expected = batch.attempts.length;
+    if (!batch.baseline.observable || !snapshot.observable) {
+      return { state: 'unknown', expected, found: 0, reason: snapshot.reason || '送出前的報告清單無法辨識' };
+    }
+    const before = batch.baseline.cards;
+    let fresh;
+    if (before.length === 0) {
+      fresh = snapshot.cards;
+    } else {
+      // 有舊報告時必須有穩定 ID；不拿 AI 改寫的標題或單純文字長度判斷。
+      if ([...before, ...snapshot.cards].some(c => !c.key)) {
+        return { state: 'unknown', expected, found: 0, reason: '已有報告但缺少穩定識別碼，無法排除舊項目' };
+      }
+      const oldKeys = new Set(before.map(c => c.key));
+      if (before.some(c => !snapshot.cards.some(x => x.key === c.key))) {
+        return { state: 'unknown', expected, found: 0, reason: '原有報告清單發生變動' };
+      }
+      fresh = snapshot.cards.filter(c => !oldKeys.has(c.key));
+    }
+    const counts = { completed: 0, generating: 0, google_error: 0, unknown: 0 };
+    fresh.forEach(c => counts[c.status]++);
+    return { state: fresh.length === expected && !counts.unknown ? 'matched' : 'unknown',
+      expected, found: fresh.length, ...counts,
+      reason: fresh.length === expected ? '' : '新報告數量與送出數量尚未一致' };
+  }
+  let reportCheckTimer = null;
+  function auditReports(batch, finalCheck = false) {
+    const summary = summarizeReports(batch, captureReports());
+    batch.lastAudit = { at: now(), ...summary };
+    saveReportBatch(batch);
+    const prefix = finalCheck ? '三分鐘後整批核對' : '送出後整批核對';
+    if (summary.state === 'matched') {
+      UI.log(`📋 ${prefix}：新報告 ${summary.found}／送出 ${summary.expected}｜已完成 ${summary.completed}｜生成中 ${summary.generating}｜Google 回報失敗 ${summary.google_error}`);
+    } else {
+      UI.log(`📋 ${prefix}：待確認｜可辨識新報告 ${summary.found}／送出 ${summary.expected}｜${summary.reason || '部分項目狀態不明'}；不自動重送`);
+    }
+    if (finalCheck && summary.generating) UI.log('   ⓘ Google 仍在生成，不列為腳本操作失敗，也不重送');
+    return summary;
+  }
+  function scheduleReportAudit(batch) {
+    if (reportCheckTimer !== null) clearTimeout(reportCheckTimer);
+    if (!batch.attempts.length || batch.finalAuditDone) return;
+    const remaining = Math.max(0, batch.attempts[batch.attempts.length - 1].at + CFG.REPORT_RECHECK_MS - now());
+    reportCheckTimer = setTimeout(() => {
+      reportCheckTimer = null;
+      // 僅核對同一筆記本的同一批；不得在其他操作中切版面或點生成。
+      const current = loadReportBatch();
+      if (!current || current.id !== batch.id) return;
+      if (running || layoutBusy) { reportCheckTimer = setTimeout(() => scheduleReportAudit(current), 1000); return; }
+      try {
+        auditReports(current, true);
+        current.finalAuditDone = true;
+        saveReportBatch(current);
+      } catch (_) { UI.log('⚠️ 整批核對紀錄無法保存；已送出的項目不重送'); }
+    }, remaining);
   }
 
   /* ── ★ v12.1 主執行緒閒置偵測 ──
@@ -2208,7 +2331,7 @@
     list.forEach((s, i) => UI.log(`   #${i + 1}  ${s.title.slice(0, 60)}`));
     return list;
   }
-  async function processOne(idx, list) {
+  async function processOne(idx, list, batch) {
     const T = makeTimer();
     const stage = name => {
       checkVideoTask();
@@ -2268,7 +2391,7 @@
       T.mark(`選格式(${CFG.REPORT_FORMAT})`);
     }
 
-    // 按鈕要等 Angular 跑完一輪變更偵測才解鎖；等不到就照樣點（同 findInsertBtn 的策略）
+    // 按鈕必須可用才送出；不把對 disabled 按鈕的無效點擊記為已送出。
     stage('找生成鈕');
     let genBtn = await waitFor(() => {
       const b = findGenerateBtn(dlg);
@@ -2277,23 +2400,19 @@
     T.mark('找生成鈕');
 
     if (!genBtn) {
-      genBtn = findGenerateBtn(dlg);
-      if (genBtn) UI.log('   ⚠️ 「立即生成」仍為停用狀態，照樣點下去');
-    }
-    if (!genBtn) {
       dumpDialogButtons('找不到「立即生成」，關閉彈窗前留存現場');
-      throw new Error('找不到「立即生成」按鈕');
+      throw new Error('找不到可用的「立即生成」按鈕');
     }
 
-    // ★ v11.4 改成偵測工作室內容變化，不再固定睡 2 秒
-    stage('送出與確認');
-    const sigBefore = studioSignature();
+    // 先記帳再點擊；生成完成交給整批核對，不逐部等待 Google。
+    stage('送出生成');
+    const attempts = [...batch.attempts, { index: idx, title: list[idx].title, at: now() }];
+    saveReportBatch({ ...batch, attempts, finalAuditDone: false });
+    batch.attempts = attempts;
+    batch.finalAuditDone = false;
     fireClick(genBtn, true);
-    const changed = await waitFor(
-      () => studioSignature() !== sigBefore, CFG.SUBMIT_BUFFER_MS, 150
-    );
     await sleep(CFG.SUBMIT_SETTLE_MS);
-    T.mark(changed ? '送出確認' : '送出等滿');
+    T.mark('已執行送出');
 
     stage('收尾');
     await closeModals();                       T.mark('收尾');
@@ -2323,33 +2442,52 @@
     UI.btnRetry.style.display = 'none';
     const t0 = now();
     const failed = [];
-    let ok = 0, deferred = 0;
+    let ok = 0, deferred = 0, skipped = 0, batch = null;
     try {
       const list = await scan();
       const target = (indices && indices.length) ? indices
                    : (CFG.ONLY_INDEX !== null ? [CFG.ONLY_INDEX]
                    : list.map((_, i) => i));
+      const titles = list.map(s => s.title);
+      const previous = loadReportBatch();
+      batch = previous && JSON.stringify(previous.titles) === JSON.stringify(titles) ? previous : {
+        id: `${now()}-${Math.random().toString(36).slice(2)}`, notebook: location.pathname,
+        titles, baseline: captureReports(), attempts: [], finalAuditDone: false,
+      };
+      saveReportBatch(batch);
       UI.log(`🚀 開始處理 ${target.length} 部（來源總數 ${list.length}）`);
       for (const idx of target) {
         if (stopFlag) { UI.log('⏹ 使用者中止'); break; }
         if (!list[idx]) { failed.push(idx); UI.log(`❌ #${idx + 1} 不存在`); continue; }
+        if (batch.attempts.some(a => a.index === idx && a.title === list[idx].title)) {
+          skipped++;
+          UI.log(`⏭ #${idx + 1} 已有送出紀錄，保留 Google 生成結果，不重送`);
+          continue;
+        }
         UI.status(`處理中 ${idx + 1}／${list.length}：${list[idx].title.slice(0, 30)}`);
         const vt = now();
         try {
           // 工作完全退出前，不清除 context、不啟動下一部。
           let detail;
-          activeVideoTask = { startedAt: vt, deadline: vt + CFG.VIDEO_HARD_TIMEOUT_MS, stage: '開始' };
+          activeVideoTask = { startedAt: vt, deadline: workNow() + CFG.VIDEO_HARD_TIMEOUT_MS,
+            delayAtStart: schedulerDelayMs, stage: '開始' };
           try {
-            detail = await processOne(idx, list);
-            checkVideoTask();
+            detail = await processOne(idx, list, batch);
+            checkVideoTask(false);
           } finally {
             activeVideoTask = null;
           }
           ok++;
-          UI.log(`✅ #${idx + 1} ${list[idx].title.slice(0, 24)}（${Math.round((now() - vt) / 1000)}s）｜${detail}`);
+          UI.log(`📤 #${idx + 1} 已執行送出：${list[idx].title.slice(0, 24)}（${Math.round((now() - vt) / 1000)}s）｜${detail}`);
         } catch (e) {
-          failed.push(idx);
-          UI.log(`❌ #${idx + 1} 失敗：${e.message}`);
+          const attempted = batch.attempts.some(a => a.index === idx);
+          if (attempted) {
+            ok++;
+            UI.log(`⚠️ #${idx + 1} 送出後收尾未完成：${e.message}；留待整批核對，不加入重送清單`);
+          } else {
+            failed.push(idx);
+            UI.log(`❌ #${idx + 1} 操作失敗：${e.message}`);
+          }
           UI.log(`   現場快照 ▸ ${snapshot()}`);
           deepDump();
           if (stopFlag) break;
@@ -2357,7 +2495,8 @@
             await recoverSourceList(list);
           } catch (recoveryError) {
             UI.log(`🛑 停止整批：${recoveryError.message}；保留剩餘項目供重跑`);
-            const pending = target.slice(target.indexOf(idx) + 1).filter(i => list[i]);
+            const pending = target.slice(target.indexOf(idx) + 1)
+              .filter(i => list[i] && !batch.attempts.some(a => a.index === i));
             deferred += pending.length;
             failed.push(...pending);
             UI.log(`   未處理 ${pending.length} 部（已加入重跑清單）`);
@@ -2366,14 +2505,15 @@
         }
         await sleep(CFG.CLICK_DELAY_MS);
       }
+      if (batch.attempts.length && !stopFlag) auditReports(batch);
     } catch (e) {
       UI.log(`💥 流程中斷：${e.message}`);
       UI.log(`   現場快照 ▸ ${snapshot()}`);
       deepDump();
     } finally {
       const secs = Math.round((now() - t0) / 1000);
-      UI.log(`—— 結束：成功 ${ok}｜失敗 ${failed.length - deferred}｜未處理 ${deferred}｜總耗時 ${secs}s ——`);
-      saveState({ ts: Date.now(), failed, ok, deferred, secs });
+      UI.log(`—— 送出階段結束：已執行送出 ${ok}｜略過已送出 ${skipped}｜操作失敗 ${failed.length - deferred}｜未處理 ${deferred}｜總耗時 ${secs}s ——`);
+      saveState({ ts: Date.now(), failed, ok, deferred, skipped, secs });
       if (failed.length) {
         UI.btnRetry.textContent = `↻ 重跑失敗 (${failed.length})`;
         UI.btnRetry.style.display = '';
@@ -2381,7 +2521,11 @@
       UI.done(ok, failed.length);
       running = false;
       UI.setLayoutBtn(readMode(), false);
-      if (!failed.length && ok > 0 && CFG.ON_DONE_LAYOUT) {
+      if (batch && batch.attempts.length && !stopFlag) {
+        UI.log('   ⓘ 最後送出滿三分鐘後再整批核對一次；背景延後喚醒不判生成失敗');
+        scheduleReportAudit(batch);
+      }
+      if (!stopFlag && !failed.length && (ok + skipped) > 0 && CFG.ON_DONE_LAYOUT) {
         try { await applyReadingLayout(); }   // 內部 writeMode 會同步按鈕
         catch (e) { UI.log(`⚠️ 版面套用失敗：${e.message}`); }
       }
@@ -2449,6 +2593,11 @@
   });
 
   (function bootCheck() {
+    const reportBatch = loadReportBatch();
+    if (reportBatch && reportBatch.attempts.length) {
+      UI.log(`📋 本筆記本已有 ${reportBatch.attempts.length} 部送出紀錄；保留結果，不自動重送`);
+      scheduleReportAudit(reportBatch);
+    }
     const s = loadState();
     if (s.failed && s.failed.length) {
       const when = new Date(s.ts).toLocaleString('zh-TW');
